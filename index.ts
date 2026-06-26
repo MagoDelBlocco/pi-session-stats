@@ -20,34 +20,53 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 
 const SEGMENTS = 50;
 const SYMBOL = "⏥";
+const ESTIMATED_IMAGE_CHARS = 4800;
 const encoder = new TextEncoder();
 
 // ── Token estimation ───────────────────────────────────────────────
 
 function estimateMessageTokens(message: Record<string, unknown>): number {
+	const role = message.role as string;
+
+	if (role === "bashExecution") {
+		const command = typeof message.command === "string" ? message.command : "";
+		const output = typeof message.output === "string" ? message.output : "";
+		return Math.ceil((command.length + output.length) / 4);
+	}
+
+	if (role === "branchSummary" || role === "compactionSummary") {
+		const summary = typeof message.summary === "string" ? message.summary : "";
+		return Math.ceil(summary.length / 4);
+	}
+
 	const content = message.content;
 
 	if (typeof content === "string") {
-		return Math.ceil(encoder.encode(content).length / 4);
+		return Math.ceil(content.length / 4);
 	}
 
 	if (!Array.isArray(content)) {
 		return 0;
 	}
 
-	let bytes = 0;
+	let chars = 0;
 
 	for (const part of content) {
 		if (part.type === "text") {
-			bytes += encoder.encode(part.text ?? "").length;
+			chars += typeof part.text === "string" ? part.text.length : 0;
+		} else if (part.type === "thinking") {
+			chars += typeof part.thinking === "string" ? part.thinking.length : 0;
+		} else if (part.type === "toolCall") {
+			chars += (typeof part.name === "string" ? part.name.length : 0)
+				+ JSON.stringify((part as Record<string, unknown>).arguments ?? {}).length;
 		} else if (part.type === "image") {
-			bytes += 768 * 4;
+			chars += ESTIMATED_IMAGE_CHARS;
 		} else if (part.type === "tool_use") {
-			bytes += encoder.encode(JSON.stringify(part)).length;
+			chars += JSON.stringify(part).length;
 		}
 	}
 
-	return Math.ceil(bytes / 4);
+	return Math.ceil(chars / 4);
 }
 
 // ── Message range extraction ───────────────────────────────────────
@@ -104,8 +123,8 @@ function buildBar(
 	contextWindow: number,
 	lastUserStart: number,
 	theme: { fg: (c: string, s: string) => string; bg: (c: string, s: string) => string },
+	used: number,
 ): string {
-	const used = ranges.length > 0 ? ranges[ranges.length - 1]!.end : 0;
 	const segmentsFilled = Math.min(
 		SEGMENTS,
 		Math.ceil((used / contextWindow) * SEGMENTS),
@@ -204,8 +223,10 @@ function makeFooterRender(ctx: ExtensionContext) {
 
 		if (contextWindow) {
 			const { ranges, lastUserStart } = buildMessageRanges(ctx.sessionManager.getBranch());
-			const used = ranges.length > 0 ? ranges[ranges.length - 1]!.end : 0;
-			const bar = buildBar(ranges, contextWindow, lastUserStart, theme);
+			const estimatedUsed = ranges.length > 0 ? ranges[ranges.length - 1]!.end : 0;
+			const actualUsage = ctx.getContextUsage();
+			const used = actualUsage?.tokens ?? estimatedUsed;
+			const bar = buildBar(ranges, contextWindow, lastUserStart, theme, used);
 			const label = theme.fg("dim", fmt(used) + "/" + fmt(contextWindow));
 			lines.push(truncateToWidth(label + " │ " + bar, width));
 		} else {

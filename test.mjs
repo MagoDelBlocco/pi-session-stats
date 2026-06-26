@@ -7,32 +7,51 @@ import assert from "node:assert/strict";
 
 const SEGMENTS = 50;
 const SYMBOL = "⏥";
+const ESTIMATED_IMAGE_CHARS = 4800;
 const encoder = new TextEncoder();
 
 function estimateMessageTokens(message) {
+	const role = message.role;
+
+	if (role === "bashExecution") {
+		const command = typeof message.command === "string" ? message.command : "";
+		const output = typeof message.output === "string" ? message.output : "";
+		return Math.ceil((command.length + output.length) / 4);
+	}
+
+	if (role === "branchSummary" || role === "compactionSummary") {
+		const summary = typeof message.summary === "string" ? message.summary : "";
+		return Math.ceil(summary.length / 4);
+	}
+
 	const content = message.content;
 
 	if (typeof content === "string") {
-		return Math.ceil(encoder.encode(content).length / 4);
+		return Math.ceil(content.length / 4);
 	}
 
 	if (!Array.isArray(content)) {
 		return 0;
 	}
 
-	let bytes = 0;
+	let chars = 0;
 
 	for (const part of content) {
 		if (part.type === "text") {
-			bytes += encoder.encode(part.text ?? "").length;
+			chars += typeof part.text === "string" ? part.text.length : 0;
+		} else if (part.type === "thinking") {
+			chars += typeof part.thinking === "string" ? part.thinking.length : 0;
+		} else if (part.type === "toolCall") {
+			chars += (typeof part.name === "string" ? part.name.length : 0)
+				+ JSON.stringify(part.arguments ?? {}).length;
 		} else if (part.type === "image") {
-			bytes += 768 * 4;
+			chars += ESTIMATED_IMAGE_CHARS;
 		} else if (part.type === "tool_use") {
-			bytes += encoder.encode(JSON.stringify(part)).length;
+			chars += JSON.stringify(part).length;
 		}
 	}
 
-	return Math.ceil(bytes / 4);
+	return Math.ceil(chars / 4);
 }
 
 function buildMessageRanges(entries) {
@@ -99,8 +118,7 @@ function segmentColor(range, theme) {
 	}
 }
 
-function buildBar(ranges, contextWindow, lastUserStart, theme) {
-	const used = ranges.length > 0 ? ranges[ranges.length - 1].end : 0;
+function buildBar(ranges, contextWindow, lastUserStart, theme, used) {
 	const segmentsFilled = Math.min(
 		SEGMENTS,
 		Math.ceil((used / contextWindow) * SEGMENTS),
@@ -162,7 +180,7 @@ describe("estimateMessageTokens", () => {
 		const msg = { content: "Hello world" };
 		const tokens = estimateMessageTokens(msg);
 		assert.ok(tokens > 0, "should estimate positive tokens");
-		assert.strictEqual(tokens, Math.ceil(encoder.encode("Hello world").length / 4));
+		assert.strictEqual(tokens, Math.ceil("Hello world".length / 4));
 	});
 
 	test("estimates array content with text parts", () => {
@@ -174,18 +192,39 @@ describe("estimateMessageTokens", () => {
 	test("estimates image content", () => {
 		const msg = { content: [{ type: "image", source: {} }] };
 		const tokens = estimateMessageTokens(msg);
-		assert.strictEqual(tokens, 768);
+		assert.strictEqual(tokens, 1200);
 	});
 
-	test("estimates tool_use content", () => {
+	test("estimates toolCall content", () => {
 		const msg = {
 			content: [
 				{ type: "text", text: "Let me read that file." },
-				{ type: "tool_use", id: "tool_1", name: "read", input: { path: "foo.ts" } },
+				{ type: "toolCall", id: "tool_1", name: "read", arguments: { path: "foo.ts" } },
 			],
 		};
 		const tokens = estimateMessageTokens(msg);
 		assert.ok(tokens > 0);
+	});
+
+	test("estimates thinking content", () => {
+		const msg = {
+			content: [
+				{ type: "text", text: "Let me think about this." },
+				{ type: "thinking", thinking: "I need to consider the implications carefully." },
+			],
+		};
+		const tokens = estimateMessageTokens(msg);
+		assert.ok(tokens > 0);
+	});
+
+	test("estimates bashExecution content", () => {
+		const msg = {
+			role: "bashExecution",
+			command: "ls -la",
+			output: "total 0",
+		};
+		const tokens = estimateMessageTokens(msg);
+		assert.strictEqual(tokens, Math.ceil(("ls -la".length + "total 0".length) / 4));
 	});
 
 	test("returns 0 for empty content", () => {
@@ -328,7 +367,7 @@ describe("buildBar", () => {
 			{ start: 0, end: 1000, type: "system" },
 		];
 
-		const bar = buildBar(ranges, 100000, 0, theme);
+		const bar = buildBar(ranges, 100000, 0, theme, 1000);
 		// Each segment is one symbol with ANSI codes, count the symbols
 		const symbolCount = (bar.match(/⏥/g) || []).length;
 		assert.strictEqual(symbolCount, SEGMENTS);
@@ -337,7 +376,7 @@ describe("buildBar", () => {
 	test("fills segments proportionally to usage", () => {
 		// 5000 tokens used out of 100000 = 5% = 2.5 segments → ceil = 3
 		const ranges = [{ start: 0, end: 5000, type: "system" }];
-		const bar = buildBar(ranges, 100000, 0, theme);
+		const bar = buildBar(ranges, 100000, 0, theme, 5000);
 
 		const filledCount = (bar.match(/\[ACCENT:/g) || []).length;
 		assert.strictEqual(filledCount, 3);
@@ -352,7 +391,7 @@ describe("buildBar", () => {
 			{ start: 90100, end: 100000, type: "assistant" },
 		];
 
-		const bar = buildBar(ranges, 200000, 90000, theme);
+		const bar = buildBar(ranges, 200000, 90000, theme, 100000);
 		const bgCount = (bar.match(/\{customMessageBg:/g) || []).length;
 		const litCount = (bar.match(/⏥/g) || []).length - (bar.match(/\[DIM:⏥\]/g) || []).length;
 
@@ -362,7 +401,7 @@ describe("buildBar", () => {
 
 	test("no background when there is no user message yet", () => {
 		const ranges = [{ start: 0, end: 5000, type: "system" }];
-		const bar = buildBar(ranges, 100000, Infinity, theme);
+		const bar = buildBar(ranges, 100000, Infinity, theme, 5000);
 		assert.ok(!bar.includes("{customMessageBg:"), "nothing before the first user msg");
 	});
 
@@ -373,7 +412,7 @@ describe("buildBar", () => {
 			{ start: 0, end: 3000, type: "system" },
 			{ start: 3000, end: 13829, type: "tool", toolName: "read" },
 		];
-		const bar = buildBar(ranges, 200000, 0, theme);
+		const bar = buildBar(ranges, 200000, 0, theme, 13829);
 
 		// 4 lit segments, all read/system colored, zero dim among the first 4.
 		const dim = (bar.match(/\[DIM:⏥\]/g) || []).length;
@@ -382,7 +421,7 @@ describe("buildBar", () => {
 
 	test("leaves empty segments dim", () => {
 		const ranges = [{ start: 0, end: 1000, type: "system" }];
-		const bar = buildBar(ranges, 100000, 0, theme);
+		const bar = buildBar(ranges, 100000, 0, theme, 1000);
 
 		assert.ok(bar.includes("[DIM:⏥]"), "should have dim empty segments");
 	});
@@ -419,7 +458,8 @@ describe("integration: full pipeline", () => {
 
 		const { ranges, lastUserStart } = buildMessageRanges(entries);
 		const theme = makeMockTheme();
-		const bar = buildBar(ranges, 200000, lastUserStart, theme);
+		const used = ranges.length > 0 ? ranges[ranges.length - 1].end : 0;
+		const bar = buildBar(ranges, 200000, lastUserStart, theme, used);
 
 		assert.ok(bar.includes("[ACCENT:"), "should have system segments");
 		assert.ok(bar.includes("[WARNING:"), "should have read tool segments");
