@@ -57,7 +57,6 @@ function estimateMessageTokens(message) {
 function buildMessageRanges(entries) {
 	const ranges = [];
 	let cursor = 0;
-	let lastUserStart = Infinity;
 
 	for (const entry of entries) {
 		if (entry.type !== "message") continue;
@@ -74,7 +73,6 @@ function buildMessageRanges(entries) {
 			type = "system";
 		} else if (role === "user") {
 			type = "user";
-			lastUserStart = cursor;
 		} else if (role === "assistant") {
 			type = "assistant";
 		} else if (role === "tool" || role === "toolResult") {
@@ -86,7 +84,7 @@ function buildMessageRanges(entries) {
 		cursor += tokens;
 	}
 
-	return { ranges, lastUserStart };
+	return { ranges };
 }
 
 function dominantRange(ranges, lo, hi) {
@@ -118,7 +116,7 @@ function segmentColor(range, theme) {
 	}
 }
 
-function buildBar(ranges, contextWindow, lastUserStart, theme, used) {
+function buildBar(ranges, contextWindow, theme, used) {
 	const segmentsFilled = Math.min(
 		SEGMENTS,
 		Math.ceil((used / contextWindow) * SEGMENTS),
@@ -134,16 +132,11 @@ function buildBar(ranges, contextWindow, lastUserStart, theme, used) {
 			continue;
 		}
 
-		const lo = i * tokensPerSegment;
-		const hi = Math.min((i + 1) * tokensPerSegment, used);
+		const src = segmentsFilled - 1 - i;
+		const lo = src * tokensPerSegment;
+		const hi = Math.min((src + 1) * tokensPerSegment, used);
 		const range = dominantRange(ranges, lo, hi);
-		const color = range ? segmentColor(range, theme) : emptySymbol;
-
-		if (hi > lastUserStart) {
-			bar += theme.bg("customMessageBg", color);
-		} else {
-			bar += color;
-		}
+		bar += range ? segmentColor(range, theme) : emptySymbol;
 	}
 
 	return bar;
@@ -241,31 +234,12 @@ describe("buildMessageRanges", () => {
 			{ type: "message", message: { role: "assistant", content: "Hi there!" } },
 		];
 
-		const { ranges, lastUserStart } = buildMessageRanges(entries);
+		const { ranges } = buildMessageRanges(entries);
 
 		assert.strictEqual(ranges.length, 3);
 		assert.strictEqual(ranges[0].type, "system");
 		assert.strictEqual(ranges[1].type, "user");
 		assert.strictEqual(ranges[2].type, "assistant");
-		assert.ok(Number.isFinite(lastUserStart), "lastUserStart should be set");
-	});
-
-	test("tracks last user message start position", () => {
-		const entries = [
-			{ type: "message", message: { role: "system", content: "System prompt here." } },
-			{ type: "message", message: { role: "user", content: "First message" } },
-			{ type: "message", message: { role: "assistant", content: "Response" } },
-			{ type: "message", message: { role: "user", content: "Second message" } },
-			{ type: "message", message: { role: "assistant", content: "Final response" } },
-		];
-
-		const { lastUserStart } = buildMessageRanges(entries);
-		const sysTokens = estimateMessageTokens({ role: "system", content: "System prompt here." });
-		const user1Tokens = estimateMessageTokens({ role: "user", content: "First message" });
-		const assistant1Tokens = estimateMessageTokens({ role: "assistant", content: "Response" });
-
-		// start of the SECOND user message = everything before it
-		assert.strictEqual(lastUserStart, sysTokens + user1Tokens + assistant1Tokens);
 	});
 
 	test("identifies tool messages with tool names", () => {
@@ -293,9 +267,8 @@ describe("buildMessageRanges", () => {
 	});
 
 	test("handles empty entries", () => {
-		const { ranges, lastUserStart } = buildMessageRanges([]);
+		const { ranges } = buildMessageRanges([]);
 		assert.strictEqual(ranges.length, 0);
-		assert.strictEqual(lastUserStart, Infinity);
 	});
 });
 
@@ -367,7 +340,7 @@ describe("buildBar", () => {
 			{ start: 0, end: 1000, type: "system" },
 		];
 
-		const bar = buildBar(ranges, 100000, 0, theme, 1000);
+		const bar = buildBar(ranges, 100000, theme, 1000);
 		// Each segment is one symbol with ANSI codes, count the symbols
 		const symbolCount = (bar.match(/⏥/g) || []).length;
 		assert.strictEqual(symbolCount, SEGMENTS);
@@ -376,33 +349,21 @@ describe("buildBar", () => {
 	test("fills segments proportionally to usage", () => {
 		// 5000 tokens used out of 100000 = 5% = 2.5 segments → ceil = 3
 		const ranges = [{ start: 0, end: 5000, type: "system" }];
-		const bar = buildBar(ranges, 100000, 0, theme, 5000);
+		const bar = buildBar(ranges, 100000, theme, 5000);
 
 		const filledCount = (bar.match(/\[ACCENT:/g) || []).length;
 		assert.strictEqual(filledCount, 3);
 	});
 
-	test("backgrounds only the current round, not the whole bar", () => {
-		// 100k used of 200k → 25 lit segments. Last user message starts at
-		// 90k, so only the final ~5 segments are the current round.
+	test("never applies a background to any segment", () => {
 		const ranges = [
 			{ start: 0, end: 90000, type: "assistant" },
 			{ start: 90000, end: 90100, type: "user" },
 			{ start: 90100, end: 100000, type: "assistant" },
 		];
 
-		const bar = buildBar(ranges, 200000, 90000, theme, 100000);
-		const bgCount = (bar.match(/\{customMessageBg:/g) || []).length;
-		const litCount = (bar.match(/⏥/g) || []).length - (bar.match(/\[DIM:⏥\]/g) || []).length;
-
-		assert.ok(bgCount > 0, "current round should be highlighted");
-		assert.ok(bgCount < litCount, "background must not cover every lit segment");
-	});
-
-	test("no background when there is no user message yet", () => {
-		const ranges = [{ start: 0, end: 5000, type: "system" }];
-		const bar = buildBar(ranges, 100000, Infinity, theme, 5000);
-		assert.ok(!bar.includes("{customMessageBg:"), "nothing before the first user msg");
+		const bar = buildBar(ranges, 200000, theme, 100000);
+		assert.ok(!bar.includes("{customMessageBg:"), "bar must not set any background");
 	});
 
 	test("last lit segment is colored, never a dim hole", () => {
@@ -412,16 +373,30 @@ describe("buildBar", () => {
 			{ start: 0, end: 3000, type: "system" },
 			{ start: 3000, end: 13829, type: "tool", toolName: "read" },
 		];
-		const bar = buildBar(ranges, 200000, 0, theme, 13829);
+		const bar = buildBar(ranges, 200000, theme, 13829);
 
 		// 4 lit segments, all read/system colored, zero dim among the first 4.
 		const dim = (bar.match(/\[DIM:⏥\]/g) || []).length;
 		assert.strictEqual(dim, SEGMENTS - 4, "only unused segments are dim");
 	});
 
+	test("reverses lit order: leftmost lit segment is the most recent span", () => {
+		// system occupies [0,4000) (oldest), read occupies [4000,8000) (newest).
+		// 8000 used of 100000 → 4 lit segments. With the reversal, the most
+		// recent (read) span lands on the LEFT, oldest (system) at the boundary.
+		const ranges = [
+			{ start: 0, end: 4000, type: "system" },
+			{ start: 4000, end: 8000, type: "tool", toolName: "read" },
+		];
+		const bar = buildBar(ranges, 100000, theme, 8000);
+		const symbols = bar.match(/\[[A-Z]+:⏥\]/g) || [];
+		assert.strictEqual(symbols[0], "[WARNING:⏥]", "leftmost lit = newest (read)");
+		assert.strictEqual(symbols[3], "[ACCENT:⏥]", "boundary lit = oldest (system)");
+	});
+
 	test("leaves empty segments dim", () => {
 		const ranges = [{ start: 0, end: 1000, type: "system" }];
-		const bar = buildBar(ranges, 100000, 0, theme, 1000);
+		const bar = buildBar(ranges, 100000, theme, 1000);
 
 		assert.ok(bar.includes("[DIM:⏥]"), "should have dim empty segments");
 	});
@@ -456,14 +431,14 @@ describe("integration: full pipeline", () => {
 			{ type: "message", message: { role: "assistant", content: "Here is the content." } },
 		];
 
-		const { ranges, lastUserStart } = buildMessageRanges(entries);
+		const { ranges } = buildMessageRanges(entries);
 		const theme = makeMockTheme();
 		const used = ranges.length > 0 ? ranges[ranges.length - 1].end : 0;
-		const bar = buildBar(ranges, 200000, lastUserStart, theme, used);
+		const bar = buildBar(ranges, 200000, theme, used);
 
 		assert.ok(bar.includes("[ACCENT:"), "should have system segments");
 		assert.ok(bar.includes("[WARNING:"), "should have read tool segments");
 		assert.ok(bar.includes("[DIM:"), "should have empty segments");
-		assert.ok(bar.includes("{customMessageBg:"), "should have background for last round");
+		assert.ok(!bar.includes("{customMessageBg:"), "bar must not set any background");
 	});
 });

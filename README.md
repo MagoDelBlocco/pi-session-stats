@@ -2,14 +2,14 @@
 
 A [pi](https://github.com/earendil-works/pi-coding-agent) extension that replaces the default footer with a color-coded context window visualization bar.
 
-See at a glance how your context budget is spent across message types, where the last round ended, and which tools are consuming the most tokens.
+See at a glance how your context budget is spent across message types and which tools are consuming the most tokens.
 
 ## Features
 
 - **Context usage bar** — 50 segments (⏥), each representing 2% of the context window
 - **Per-message coloring** — each segment colored by the majority content type in that range
 - **Tool differentiation** — `read` tool output in yellow, other tools in red
-- **Last-round marker** — gray background on segments up to the last user message
+- **Most-recent-first layout** — lit segments run newest → oldest from the left, with unused context dim on the right
 - **Extension status passthrough** — preserves status widgets from other extensions
 - **Live updates** — auto-refreshes on agent start, message streaming, and model changes
 
@@ -22,7 +22,6 @@ See at a glance how your context budget is spent across message types, where the
 | 🟡 yellow (`warning`) | `read` tool output |
 | 🔴 red (`error`) | Other tool output (`bash`, `edit`, `write`, etc.) |
 | ⚫ dim | Unused context |
-| ▒ gray bg | Up to the last user message position |
 
 ## Layout
 

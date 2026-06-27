@@ -11,8 +11,8 @@
  *   red      = other tool output
  *   dim      = unused context
  *
- * Gray background marks the current round: from the last user message to
- * the end of context.
+ * The lit segments are laid out in reverse order (most recent on the left,
+ * oldest at the lit/dim boundary); unused context stays dim on the right.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -80,11 +80,9 @@ interface MessageRange {
 
 function buildMessageRanges(
 	entries: Array<{ type: string; message?: Record<string, unknown> }>,
-): { ranges: MessageRange[]; lastUserStart: number } {
+): { ranges: MessageRange[] } {
 	const ranges: MessageRange[] = [];
 	let cursor = 0;
-	// Sentinel: no user message yet → nothing is in the "current round".
-	let lastUserStart = Infinity;
 
 	for (const entry of entries) {
 		if (entry.type !== "message") continue;
@@ -101,7 +99,6 @@ function buildMessageRanges(
 			type = "system";
 		} else if (role === "user") {
 			type = "user";
-			lastUserStart = cursor;
 		} else if (role === "assistant") {
 			type = "assistant";
 		} else if (role === "tool" || role === "toolResult") {
@@ -113,7 +110,7 @@ function buildMessageRanges(
 		cursor += tokens;
 	}
 
-	return { ranges, lastUserStart };
+	return { ranges };
 }
 
 // ── Bar construction ───────────────────────────────────────────────
@@ -121,8 +118,7 @@ function buildMessageRanges(
 function buildBar(
 	ranges: MessageRange[],
 	contextWindow: number,
-	lastUserStart: number,
-	theme: { fg: (c: string, s: string) => string; bg: (c: string, s: string) => string },
+	theme: { fg: (c: string, s: string) => string },
 	used: number,
 ): string {
 	const segmentsFilled = Math.min(
@@ -141,22 +137,19 @@ function buildBar(
 			continue;
 		}
 
+		// Reverse the order of the lit segments while keeping the dim/inactive
+		// segments on the right: the leftmost lit segment maps to the last
+		// token span and the segment at the lit/dim boundary maps to the first.
+		const src = segmentsFilled - 1 - i;
+
 		// Span of context (in tokens) this segment represents, clamped to
 		// what's actually used so the final partial segment is never a hole.
-		const lo = i * tokensPerSegment;
-		const hi = Math.min((i + 1) * tokensPerSegment, used);
+		const lo = src * tokensPerSegment;
+		const hi = Math.min((src + 1) * tokensPerSegment, used);
 
 		// Color by the message type occupying the largest share of the span.
 		const range = dominantRange(ranges, lo, hi);
-		const color = range ? segmentColor(range, theme) : emptySymbol;
-
-		// Highlight the current round: everything from the last user message
-		// to the end of context.
-		if (hi > lastUserStart) {
-			bar += theme.bg("customMessageBg", color);
-		} else {
-			bar += color;
-		}
+		bar += range ? segmentColor(range, theme) : emptySymbol;
 	}
 
 	return bar;
@@ -222,11 +215,11 @@ function makeFooterRender(ctx: ExtensionContext) {
 		const contextWindow = ctx.model?.contextWindow;
 
 		if (contextWindow) {
-			const { ranges, lastUserStart } = buildMessageRanges(ctx.sessionManager.getBranch());
+			const { ranges } = buildMessageRanges(ctx.sessionManager.getBranch());
 			const estimatedUsed = ranges.length > 0 ? ranges[ranges.length - 1]!.end : 0;
 			const actualUsage = ctx.getContextUsage();
 			const used = actualUsage?.tokens ?? estimatedUsed;
-			const bar = buildBar(ranges, contextWindow, lastUserStart, theme, used);
+			const bar = buildBar(ranges, contextWindow, theme, used);
 			const label = theme.fg("dim", fmt(used) + "/" + fmt(contextWindow));
 			lines.push(truncateToWidth(label + " │ " + bar, width));
 		} else {
