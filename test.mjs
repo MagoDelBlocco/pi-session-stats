@@ -1,152 +1,21 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
-// ---------------------------------------------------------------------------
-// Inline the functions under test (mirrors index.ts logic)
-// ---------------------------------------------------------------------------
-
-const SEGMENTS = 50;
-const SYMBOL = "⏥";
-const ESTIMATED_IMAGE_CHARS = 4800;
-const encoder = new TextEncoder();
-
-function estimateMessageTokens(message) {
-	const role = message.role;
-
-	if (role === "bashExecution") {
-		const command = typeof message.command === "string" ? message.command : "";
-		const output = typeof message.output === "string" ? message.output : "";
-		return Math.ceil((command.length + output.length) / 4);
-	}
-
-	if (role === "branchSummary" || role === "compactionSummary") {
-		const summary = typeof message.summary === "string" ? message.summary : "";
-		return Math.ceil(summary.length / 4);
-	}
-
-	const content = message.content;
-
-	if (typeof content === "string") {
-		return Math.ceil(content.length / 4);
-	}
-
-	if (!Array.isArray(content)) {
-		return 0;
-	}
-
-	let chars = 0;
-
-	for (const part of content) {
-		if (part.type === "text") {
-			chars += typeof part.text === "string" ? part.text.length : 0;
-		} else if (part.type === "thinking") {
-			chars += typeof part.thinking === "string" ? part.thinking.length : 0;
-		} else if (part.type === "toolCall") {
-			chars += (typeof part.name === "string" ? part.name.length : 0)
-				+ JSON.stringify(part.arguments ?? {}).length;
-		} else if (part.type === "image") {
-			chars += ESTIMATED_IMAGE_CHARS;
-		} else if (part.type === "tool_use") {
-			chars += JSON.stringify(part).length;
-		}
-	}
-
-	return Math.ceil(chars / 4);
-}
-
-function buildMessageRanges(entries) {
-	const ranges = [];
-	let cursor = 0;
-
-	for (const entry of entries) {
-		if (entry.type !== "message") continue;
-
-		const msg = entry.message;
-		const tokens = estimateMessageTokens(msg);
-		if (tokens === 0) continue;
-
-		const role = msg.role;
-		let type = "assistant";
-		let toolName;
-
-		if (role === "system") {
-			type = "system";
-		} else if (role === "user") {
-			type = "user";
-		} else if (role === "assistant") {
-			type = "assistant";
-		} else if (role === "tool" || role === "toolResult") {
-			type = "tool";
-			toolName = typeof msg.toolName === "string" ? msg.toolName : undefined;
-		}
-
-		ranges.push({ start: cursor, end: cursor + tokens, type, toolName });
-		cursor += tokens;
-	}
-
-	return { ranges };
-}
-
-function dominantRange(ranges, lo, hi) {
-	let best;
-	let bestOverlap = 0;
-	for (const range of ranges) {
-		const overlap = Math.min(range.end, hi) - Math.max(range.start, lo);
-		if (overlap > bestOverlap) {
-			bestOverlap = overlap;
-			best = range;
-		}
-	}
-	return best;
-}
-
-function segmentColor(range, theme) {
-	switch (range.type) {
-		case "system":
-			return theme.fg("accent", SYMBOL);
-		case "user":
-			return theme.fg("success", SYMBOL);
-		case "assistant":
-			return theme.fg("success", SYMBOL);
-		case "tool":
-			if (range.toolName === "read") {
-				return theme.fg("warning", SYMBOL);
-			}
-			return theme.fg("error", SYMBOL);
-	}
-}
-
-function buildBar(ranges, contextWindow, theme, used) {
-	const segmentsFilled = Math.min(
-		SEGMENTS,
-		Math.ceil((used / contextWindow) * SEGMENTS),
-	);
-
-	const emptySymbol = theme.fg("dim", SYMBOL);
-	const tokensPerSegment = contextWindow / SEGMENTS;
-	let bar = "";
-
-	for (let i = 0; i < SEGMENTS; i++) {
-		if (i >= segmentsFilled) {
-			bar += emptySymbol;
-			continue;
-		}
-
-		const src = segmentsFilled - 1 - i;
-		const lo = src * tokensPerSegment;
-		const hi = Math.min((src + 1) * tokensPerSegment, used);
-		const range = dominantRange(ranges, lo, hi);
-		bar += range ? segmentColor(range, theme) : emptySymbol;
-	}
-
-	return bar;
-}
-
-function fmt(n) {
-	if (n < 1000) return `${n}`;
-	if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
-	return `${(n / 1_000_000).toFixed(1)}m`;
-}
+// The functions under test are imported from core.ts — the same module the
+// extension (index.ts) uses. This guarantees the tests exercise the exact
+// shipped code, never a duplicated copy.
+import {
+	estimateMessageTokens,
+	buildMessageRanges,
+	dominantRange,
+	segmentColor,
+	buildBar,
+	fmt,
+	fmtTps,
+	SEGMENTS,
+	TokenSpeedTracker,
+	renderCounters,
+} from "./core.ts";
 
 // Mock theme for testing
 function makeMockTheme() {
@@ -161,6 +30,17 @@ function makeMockTheme() {
 	return {
 		fg: (color, text) => `[${colors[color] || color}:${text}]`,
 		bg: (bg, text) => `{${bg}:${text}}`,
+	};
+}
+
+// Fake clock for deterministic TokenSpeedTracker tests
+function makeClock() {
+	let t = 0;
+	return {
+		now: () => t,
+		advance: (ms) => {
+			t += ms;
+		},
 	};
 }
 
@@ -440,5 +320,141 @@ describe("integration: full pipeline", () => {
 		assert.ok(bar.includes("[WARNING:"), "should have read tool segments");
 		assert.ok(bar.includes("[DIM:"), "should have empty segments");
 		assert.ok(!bar.includes("{customMessageBg:"), "bar must not set any background");
+	});
+});
+
+describe("TokenSpeedTracker", () => {
+	test("measures time to first token (TTFT)", () => {
+		const clock = makeClock();
+		const tr = new TokenSpeedTracker(1000, clock.now);
+		tr.startUser(); // t=0
+		clock.advance(320);
+		tr.firstContent(); // t=320
+		assert.strictEqual(tr.ttftMs, 320);
+	});
+
+	test("live decode TPS uses a sliding window of provider-reported output", () => {
+		const clock = makeClock();
+		const tr = new TokenSpeedTracker(1000, clock.now);
+		tr.startUser();
+		tr.assistantStart();
+		tr.firstContent(1000); // stream starts, baseline output=1000
+		// 40 output tokens over 400ms → ~100 tok/s
+		for (let i = 1; i <= 40; i++) {
+			clock.advance(10);
+			tr.delta(1000 + i);
+		}
+		assert.ok(tr.isStreaming, "stream is in progress");
+		assert.ok(tr.decodeTps > 60, "decode rate is elevated");
+		assert.ok(tr.decodeTps < 150, "window smooths to ~100 tok/s");
+	});
+
+	test("reconciles decode total to authoritative usage at message end", () => {
+		const clock = makeClock();
+		const tr = new TokenSpeedTracker(1000, clock.now);
+		tr.startUser();
+		tr.assistantStart();
+		tr.firstContent(0); // t=0, stream starts
+		clock.advance(2000);
+		tr.assistantEnd(80); // 80 output tokens over 2s
+		assert.strictEqual(tr.decodeTpsAvg, 40);
+		assert.strictEqual(tr.isStreaming, false);
+	});
+
+	test("reset on a new user message clears prior turn counters", () => {
+		const clock = makeClock();
+		const tr = new TokenSpeedTracker(1000, clock.now);
+		tr.startUser();
+		tr.assistantStart();
+		tr.firstContent(0);
+		clock.advance(2000);
+		tr.assistantEnd(80);
+		assert.strictEqual(tr.decodeTpsAvg, 40);
+
+		tr.startUser(); // new turn resets state
+		assert.strictEqual(tr.ttftMs, 0);
+		assert.strictEqual(tr.decodeTpsAvg, 0);
+	});
+
+	test("keeps thinking tokens in decode when text_start follows thinking_start", () => {
+		const clock = makeClock();
+		const tr = new TokenSpeedTracker(1000, clock.now);
+		tr.startUser(); // t=0
+		clock.advance(300);
+		tr.assistantStart();
+		// thinking phase
+		tr.firstContent(0); // thinking_start, baseline output 0
+		clock.advance(100);
+		tr.delta(30); // 30 thinking tokens
+		clock.advance(100);
+		tr.delta(60); // 60 thinking tokens cumulative
+		// text phase begins — text_start fires firstContent again
+		tr.firstContent(60); // must NOT wipe the thinking window
+		clock.advance(100);
+		tr.delta(70); // 10 text tokens → 70 total
+		assert.strictEqual(tr.isStreaming, true);
+		// 70 tokens (thinking + text) over the window → far above a text-only rate
+		assert.ok(tr.decodeTps > 100, "decode reflects thinking + text, not just text");
+		assert.ok(tr.decodeTps < 400, "decode bounded by ~70 total tokens over the window");
+	});
+});
+
+describe("fmtTps", () => {
+	test("truncates to exactly 2 decimal places without rounding", () => {
+		assert.strictEqual(fmtTps(25.258323765786454), "25.25");
+		assert.strictEqual(fmtTps(49.62546816479401), "49.62");
+		assert.strictEqual(fmtTps(6666.666666666667), "6666.66");
+	});
+
+	test("always shows two decimal places", () => {
+		assert.strictEqual(fmtTps(50), "50.00");
+		assert.strictEqual(fmtTps(5), "5.00");
+		assert.strictEqual(fmtTps(0), "0.00");
+	});
+
+	test("handles floating-point values robustly", () => {
+		assert.strictEqual(fmtTps(0.03), "0.03");
+		assert.strictEqual(fmtTps(0.1), "0.10");
+		assert.strictEqual(fmtTps(0.07), "0.07");
+	});
+});
+
+describe("renderCounters", () => {
+	test("returns empty string when there is no data", () => {
+		const theme = makeMockTheme();
+		const clock = makeClock();
+		const tr = new TokenSpeedTracker(1000, clock.now);
+		assert.strictEqual(renderCounters(tr, theme), "");
+	});
+
+	test("renders TTFT and decode to the right of the bar", () => {
+		const theme = makeMockTheme();
+		const clock = makeClock();
+		const tr = new TokenSpeedTracker(1000, clock.now);
+		tr.startUser(); // t=0
+		clock.advance(300);
+		tr.firstContent(0);
+		clock.advance(1000);
+		tr.assistantEnd(50); // decode = 50 / 1s = 50
+
+		const s = renderCounters(tr, theme);
+		assert.ok(s.includes("ttft 300ms"), "shows TTFT");
+		assert.ok(s.includes("decode 50.00/s"), "shows decode truncated to 2 decimals");
+		assert.ok(!s.includes("prefill"), "prefill counter removed");
+	});
+
+	test("uses the live sliding-window decode rate while streaming", () => {
+		const theme = makeMockTheme();
+		const clock = makeClock();
+		const tr = new TokenSpeedTracker(1000, clock.now);
+		tr.startUser();
+		tr.assistantStart();
+		tr.firstContent(1000);
+		for (let i = 1; i <= 40; i++) {
+			clock.advance(10);
+			tr.delta(1000 + i);
+		}
+		const s = renderCounters(tr, theme);
+		assert.ok(s.includes("decode "), "shows decode while streaming");
 	});
 });
