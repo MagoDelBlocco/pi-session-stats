@@ -324,19 +324,9 @@ describe("integration: full pipeline", () => {
 });
 
 describe("TokenSpeedTracker", () => {
-	test("measures time to first token (TTFT)", () => {
-		const clock = makeClock();
-		const tr = new TokenSpeedTracker(1000, clock.now);
-		tr.startUser(); // t=0
-		clock.advance(320);
-		tr.firstContent(); // t=320
-		assert.strictEqual(tr.ttftMs, 320);
-	});
-
 	test("live decode TPS uses a sliding window of provider-reported output", () => {
 		const clock = makeClock();
 		const tr = new TokenSpeedTracker(1000, clock.now);
-		tr.startUser();
 		tr.assistantStart();
 		tr.firstContent(1000); // stream starts, baseline output=1000
 		// 40 output tokens over 400ms → ~100 tok/s
@@ -352,7 +342,6 @@ describe("TokenSpeedTracker", () => {
 	test("reconciles decode total to authoritative usage at message end", () => {
 		const clock = makeClock();
 		const tr = new TokenSpeedTracker(1000, clock.now);
-		tr.startUser();
 		tr.assistantStart();
 		tr.firstContent(0); // t=0, stream starts
 		clock.advance(2000);
@@ -361,27 +350,24 @@ describe("TokenSpeedTracker", () => {
 		assert.strictEqual(tr.isStreaming, false);
 	});
 
-	test("reset on a new user message clears prior turn counters", () => {
+	test("reset on a new assistant message clears prior turn counters", () => {
 		const clock = makeClock();
 		const tr = new TokenSpeedTracker(1000, clock.now);
-		tr.startUser();
 		tr.assistantStart();
 		tr.firstContent(0);
 		clock.advance(2000);
 		tr.assistantEnd(80);
 		assert.strictEqual(tr.decodeTpsAvg, 40);
 
-		tr.startUser(); // new turn resets state
-		assert.strictEqual(tr.ttftMs, 0);
+		tr.assistantStart(); // new turn resets state
 		assert.strictEqual(tr.decodeTpsAvg, 0);
+		assert.strictEqual(tr.hasData, false);
 	});
 
 	test("keeps thinking tokens in decode when text_start follows thinking_start", () => {
 		const clock = makeClock();
 		const tr = new TokenSpeedTracker(1000, clock.now);
-		tr.startUser(); // t=0
-		clock.advance(300);
-		tr.assistantStart();
+		tr.assistantStart(); // t=0
 		// thinking phase
 		tr.firstContent(0); // thinking_start, baseline output 0
 		clock.advance(100);
@@ -427,19 +413,18 @@ describe("renderCounters", () => {
 		assert.strictEqual(renderCounters(tr, theme), "");
 	});
 
-	test("renders TTFT and decode to the right of the bar", () => {
+	test("renders decode to the right of the bar", () => {
 		const theme = makeMockTheme();
 		const clock = makeClock();
 		const tr = new TokenSpeedTracker(1000, clock.now);
-		tr.startUser(); // t=0
-		clock.advance(300);
-		tr.firstContent(0);
+		tr.assistantStart();
+		tr.firstContent(0); // t=0, decode starts
 		clock.advance(1000);
 		tr.assistantEnd(50); // decode = 50 / 1s = 50
 
 		const s = renderCounters(tr, theme);
-		assert.ok(s.includes("ttft 300ms"), "shows TTFT");
 		assert.ok(s.includes("decode 50.00/s"), "shows decode truncated to 2 decimals");
+		assert.ok(!s.includes("ttft"), "TTFT counter removed");
 		assert.ok(!s.includes("prefill"), "prefill counter removed");
 	});
 
@@ -447,7 +432,6 @@ describe("renderCounters", () => {
 		const theme = makeMockTheme();
 		const clock = makeClock();
 		const tr = new TokenSpeedTracker(1000, clock.now);
-		tr.startUser();
 		tr.assistantStart();
 		tr.firstContent(1000);
 		for (let i = 1; i <= 40; i++) {

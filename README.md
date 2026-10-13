@@ -10,7 +10,7 @@ See at a glance how your context budget is spent across message types and which 
 - **Per-message coloring** — each segment colored by the majority content type in that range
 - **Tool differentiation** — `read` tool output in yellow, other tools in red
 - **Most-recent-first layout** — lit segments run newest → oldest from the left, with unused context dim on the right
-- **Token-speed counters** — TTFT and decode tokens-per-second to the right of the context bar (wall-clock timing over streaming events + provider-reported usage)
+- **Token-speed counter** — decode tokens-per-second to the right of the context bar (wall-clock timing over streaming events + provider-reported usage)
 - **Extension status passthrough** — preserves status widgets from other extensions
 - **Live updates** — auto-refreshes on agent start, message streaming, and model changes
 
@@ -29,7 +29,7 @@ See at a glance how your context budget is spent across message types and which 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │ /home/bogdan/project                                                   │  ← cwd (blue bg + text)
-│ 14k/262k │ ⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥ │ ttft 320ms · decode 42/s │  ← context bar + counters
+│ 14k/262k │ ⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥⏥ │ decode 42/s             │  ← context bar + counter
 │ mcp-client: connected  cycle-detection: shadow                         │  ← other extension statuses
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -46,13 +46,12 @@ No additional configuration or dependencies required.
 
 ## Token Speed
 
-The two counters to the right of the context bar are measured from wall-clock
+The counter to the right of the context bar is measured from wall-clock
 `Date.now()` timestamps over the streaming lifecycle, combined with
 provider-reported token usage:
 
 | Counter | How it's measured |
 | ------- | ----------------- |
-| **TTFT** | ms from the user message (`message_start`) to the first content block (`text_start`/`thinking_start`/`toolcall_start`) |
 | **Decode** | `usage.output` accumulated during streaming via a 1s sliding window; reconciled to the authoritative `usage.output` at `message_end` |
 
 Decode shows the live sliding-window rate while streaming, then the reconciled

@@ -76,7 +76,7 @@ export interface MessageRange {
 }
 
 export function buildMessageRanges(
-	entries: Array<{ type: string; message?: Record<string, unknown> }>,
+	entries: Array<{ type: string; message?: unknown }>,
 ): { ranges: MessageRange[] } {
 	const ranges: MessageRange[] = [];
 	let cursor = 0;
@@ -112,10 +112,20 @@ export function buildMessageRanges(
 
 // ── Bar construction ───────────────────────────────────────────────
 
+/**
+ * Minimal theme surface needed to color segments. The token union is the set
+ * of foreground theme tokens this module actually requests, so a full pi
+ * `Theme` is assignable (its `fg` accepts the wider `ThemeColor` union) while
+ * tests can pass a stub.
+ */
+export type SegmentTheme = {
+	fg: (color: "accent" | "success" | "warning" | "error" | "dim", text: string) => string;
+};
+
 export function buildBar(
 	ranges: MessageRange[],
 	contextWindow: number,
-	theme: { fg: (c: string, s: string) => string },
+	theme: SegmentTheme,
 	used: number,
 ): string {
 	const segmentsFilled = Math.min(
@@ -173,7 +183,7 @@ export function dominantRange(
 
 export function segmentColor(
 	range: MessageRange,
-	theme: { fg: (c: string, s: string) => string },
+	theme: SegmentTheme,
 ): string {
 	switch (range.type) {
 		case "system":
@@ -214,11 +224,10 @@ export function fmtTps(n: number): string {
 // ── Token speed tracking ───────────────────────────────────────────
 
 /**
- * Measures TTFT and decode tokens-per-second over the streaming lifecycle.
+ * Measures decode tokens-per-second over the streaming lifecycle.
  * Pure wall-clock timing (injectable clock for determinism) combined with
- * provider-reported token usage:
+ * provider-reported usage:
  *
- *   - TTFT   = time from the user message to the first content block (ms)
  *   - decode = usage.output accumulated during streaming via a sliding window,
  *              reconciled to the authoritative usage at message end
  *
@@ -232,9 +241,8 @@ export class TokenSpeedTracker {
 	private readonly windowMs: number;
 	private readonly now: () => number;
 
-	private t0 = 0;            // TTFT start (user message)
-	private t1 = 0;            // TTFT stop (first content block)
 	private tEnd = 0;          // decode end (assistant message end)
+	private decodeStart = 0;   // decode start (first content block)
 	private outputTokens = 0;  // reconciled decode usage.output
 	private lastOutput = 0;    // last seen usage.output during streaming
 	private streamStarted = false;
@@ -245,19 +253,10 @@ export class TokenSpeedTracker {
 		this.now = now;
 	}
 
-	/** A user message began — start the TTFT window and reset per-turn state. */
-	startUser(): void {
-		this.t0 = this.now();
-		this.t1 = 0;
-		this.outputTokens = 0;
-		this.lastOutput = 0;
-		this.streamStarted = false;
-		this.window = [];
-	}
-
 	/** An assistant message began — begin a fresh decode phase. */
 	assistantStart(): void {
 		this.tEnd = 0;
+		this.decodeStart = 0;
 		this.outputTokens = 0;
 		this.lastOutput = 0;
 		this.streamStarted = false;
@@ -265,15 +264,15 @@ export class TokenSpeedTracker {
 	}
 
 	/**
-	 * A content block arrived. Stops TTFT and begins decode streaming on the
-	 * first content block. Subsequent content blocks of the same assistant
-	 * message (e.g. `text_start` after `thinking_start`) must NOT reset the
-	 * sliding window, so thinking tokens stay counted in the decode rate.
+	 * A content block arrived — begins the decode phase on the first content
+	 * block. Subsequent content blocks of the same assistant message (e.g.
+	 * `text_start` after `thinking_start`) must NOT reset the sliding window,
+	 * so thinking tokens stay counted in the decode rate.
 	 */
 	firstContent(output?: number): void {
-		if (this.t1 === 0) this.t1 = this.now();
 		if (!this.streamStarted) {
 			this.streamStarted = true;
+			this.decodeStart = this.now();
 			this.window = [];
 			this.lastOutput = output ?? 0;
 		}
@@ -307,11 +306,6 @@ export class TokenSpeedTracker {
 		}
 	}
 
-	/** Time to first token, in milliseconds. */
-	get ttftMs(): number {
-		return this.t1 > 0 ? this.t1 - this.t0 : 0;
-	}
-
 	/** Live decode throughput from the sliding window (while streaming). */
 	get decodeTps(): number {
 		if (!this.streamStarted || this.window.length === 0) return 0;
@@ -325,7 +319,7 @@ export class TokenSpeedTracker {
 
 	/** Final decode throughput: reconciled output over decode elapsed time. */
 	get decodeTpsAvg(): number {
-		const seconds = (this.tEnd - this.t1) / 1000;
+		const seconds = (this.tEnd - this.decodeStart) / 1000;
 		return seconds > 0 && this.outputTokens > 0 ? this.outputTokens / seconds : 0;
 	}
 
@@ -336,29 +330,22 @@ export class TokenSpeedTracker {
 
 	/** Whether any counter has meaningful data to render. */
 	get hasData(): boolean {
-		return this.ttftMs > 0 || this.decodeTps > 0 || this.decodeTpsAvg > 0;
+		return this.decodeTps > 0 || this.decodeTpsAvg > 0;
 	}
 }
 
 /**
- * Renders the TTFT / decode counters as a string to place to the right of the
+ * Renders the decode counter as a string to place to the right of the
  * context bar. Uses the live sliding-window decode rate while streaming, and
  * the reconciled average after the message ends.
  */
 export function renderCounters(
 	tracker: TokenSpeedTracker,
-	theme: { fg: (c: string, s: string) => string },
+	theme: SegmentTheme,
 ): string {
 	if (!tracker.hasData) return "";
-	const parts: string[] = [];
-
-	if (tracker.ttftMs > 0) {
-		parts.push(theme.fg("warning", `ttft ${tracker.ttftMs}ms`));
-	}
 	const decode = tracker.isStreaming ? tracker.decodeTps : tracker.decodeTpsAvg;
-	if (decode > 0) {
-		parts.push(theme.fg("success", `decode ${fmtTps(decode)}/s`));
-	}
+	if (decode <= 0) return "";
 
-	return parts.length > 0 ? " │ " + parts.join(" · ") : "";
+	return " │ " + theme.fg("success", `decode ${fmtTps(decode)}/s`);
 }

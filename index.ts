@@ -60,10 +60,7 @@ interface StreamMessageEvent {
 
 function handleMessageStart(tracker: TokenSpeedTracker, event: unknown): void {
 	const msg = (event as StreamMessageEvent).message;
-	if (!msg) return;
-	if (msg.role === "user") {
-		tracker.startUser();
-	} else if (msg.role === "assistant") {
+	if (msg?.role === "assistant") {
 		tracker.assistantStart();
 	}
 }
@@ -97,6 +94,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", refresh);
 	pi.on("model_select", refresh);
+	// Tree navigation within the same session does not re-fire session_start;
+	// refresh so the bar reflects the newly active branch.
+	pi.on("session_tree", refresh);
 
 	// Token-speed tracking over the streaming lifecycle.
 	pi.on("message_start", (event) => {
